@@ -1,16 +1,19 @@
 # Local Model Broker
 
-**Tired of editing config files every time you swap a local model?**  
-**Annoyed when your AI assistant breaks because the checkpoint name changed?**
+**Tired of editing config files every time you swap a local model?**
 
-Stop hardcoding model IDs into dozens of client configs. Declare your local model servers once, and point everything at `local-auto`.
+Pi, OpenCode, Claude Code, Cline, Roocode, Continue, Aider — how many local AI agents do you run?
+
+Every time you change a checkpoint, you have to re-configure all of them. That's 5–6 agents × N configs each × 1 model swap = a lot of wasted keystrokes.
+
+Stop hardcoding model IDs into dozens of agent configs. Declare your local model servers once, and point everything at `local-auto`.
 
 ```text
 Clients ──► http://127.0.0.1:8879/v1 ──► :8888/v1 (preferred)
                      model: local-auto └─► :8880/v1 (fallback)
 ```
 
-The broker is a dependency-free, localhost OpenAI-compatible proxy that exposes **one stable model ID** (`local-auto`) while routing requests to your prioritized local model servers. Use it from Pi CLI, Hermes, CLIProxyAPI, llama.cpp, vLLM, Ollama — anything that speaks OpenAI protocol on the wire.
+The broker is a dependency-free, localhost OpenAI-compatible proxy that exposes **one stable model ID** (`local-auto`) while routing requests to your prioritized local model servers. Use it from Pi CLI, Hermes, OpenCode, Claude Code, Cline, Roocode, Continue, Aider, CLIProxyAPI, llama.cpp, vLLM, Ollama — anything that speaks OpenAI protocol on the wire.
 
 ---
 
@@ -18,9 +21,10 @@ The broker is a dependency-free, localhost OpenAI-compatible proxy that exposes 
 
 | Problem | Broker fix |
 |---|---|
-| You swap a checkpoint and now every config needs updating | **Your clients never know the model changed** — just restart the broker |
+| You swap a checkpoint and now every agent config needs updating | **Your agents never know the model changed** — just restart the broker |
 | Your primary model server crashes mid-session | **Automatic failover** to the fallback — but only if it's running the *same* model with *enough* context/output capacity |
-| A vLLM sends `deepseek-ai/DeepSeek-V4-Flash-0731` in the response but your Hermes profile expects `Local` | **Response rewriting** — every top-level `model` field is replaced with `local-auto` without touching generated text |
+| You juggle 5–6 agents and they all need different model IDs | **One alias for all of them** — point every agent at the same broker URL |
+| An agent sends `deepseek-ai/DeepSeek-V4-Flash-0731` in the response but your Hermes profile expects `Local` | **Response rewriting** — every top-level `model` field is replaced with `local-auto` without touching generated text |
 | Your client token-limits are fixed at install time | **Live metadata clamping** — the broker reads the active model's context window and output-token limit fresh on every discovery, and clamps your request so it never exceeds what the server can actually handle |
 | You maintain a private fork of a model server with minor changes | **No maintenance** — the broker is <500 lines of stdlib Python, zero pip dependencies |
 | The upstream goes silent for 30 seconds | **Cancellation propagates** — close your client and the upstream connection drops immediately |
@@ -64,9 +68,15 @@ From now on, `local-auto` is the only model ID your clients ever see.
 | Client | Base URL | Model |
 |---|---|---|
 | Pi (via included extension) | `http://127.0.0.1:8879/v1` | `local-auto` |
-| Hermes custom provider | `http://127.0.0.1:8879/v1` | `local-auto` |
+| Hermes | `http://127.0.0.1:8879/v1` | `local-auto` |
+| OpenCode | `http://127.0.0.1:8879/v1` | `local-auto` |
+| Claude Code | `http://127.0.0.1:8879/v1` | `local-auto` |
+| Cline / Roo Code | `http://127.0.0.1:8879/v1` | `local-auto` |
+| Continue | `http://127.0.0.1:8879/v1` | `local-auto` |
+| Aider | `http://127.0.0.1:8879/v1` | `local-auto` |
 | CLIProxyAPI | `http://127.0.0.1:8879/v1` | `local-auto` |
 | curl / hurl / httpx | `http://127.0.0.1:8879/v1` | `local-auto` |
+| llama.cpp / vLLM / Ollama | `http://127.0.0.1:8879/v1` | `local-auto` |
 
 Any non-empty API key works — the broker doesn't authenticate by default (binds to `127.0.0.1`).
 
