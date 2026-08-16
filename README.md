@@ -65,18 +65,17 @@ From now on, `local-auto` is the only model ID your clients ever see.
 
 ## One alias for every client
 
-| Client | Base URL | Model |
-|---|---|---|
-| Pi (via included extension) | `http://127.0.0.1:8879/v1` | `local-auto` |
-| Hermes | `http://127.0.0.1:8879/v1` | `local-auto` |
-| OpenCode | `http://127.0.0.1:8879/v1` | `local-auto` |
-| Claude Code | `http://127.0.0.1:8879/v1` | `local-auto` |
-| Cline / Roo Code | `http://127.0.0.1:8879/v1` | `local-auto` |
-| Continue | `http://127.0.0.1:8879/v1` | `local-auto` |
-| Aider | `http://127.0.0.1:8879/v1` | `local-auto` |
-| CLIProxyAPI | `http://127.0.0.1:8879/v1` | `local-auto` |
-| curl / hurl / httpx | `http://127.0.0.1:8879/v1` | `local-auto` |
-| llama.cpp / vLLM / Ollama | `http://127.0.0.1:8879/v1` | `local-auto` |
+```
+http://127.0.0.1:8879/v1  ─  model: local-auto
+```
+
+| Client | Notes |
+|---|---|
+| Pi | Included extension auto-refreshes metadata |
+| Hermes, OpenCode, Claude Code, Cline, Roo Code, Continue, Aider | Point to the broker URL with model `local-auto` |
+| CLIProxyAPI | Register as OpenAI-compatible text model |
+| llama.cpp / vLLM / Ollama | Also work as upstreams, not just clients |
+| curl / any HTTP client | `"model": "local-auto"` in the request body |
 
 Any non-empty API key works — the broker doesn't authenticate by default (binds to `127.0.0.1`).
 
