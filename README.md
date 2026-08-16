@@ -1,58 +1,39 @@
 # Local Model Broker
 
-A dependency-free, localhost OpenAI-compatible broker that exposes one stable model ID while routing requests to prioritized local model servers.
+**Tired of editing config files every time you swap a local model?**  
+**Annoyed when your AI assistant breaks because the checkpoint name changed?**
+
+Stop hardcoding model IDs into dozens of client configs. Declare your local model servers once, and point everything at `local-auto`.
 
 ```text
 Clients ──► http://127.0.0.1:8879/v1 ──► :8888/v1 (preferred)
                      model: local-auto └─► :8880/v1 (fallback)
 ```
 
-The broker lets Pi CLI, Hermes, CLIProxyAPI, and other OpenAI-compatible clients use `local-auto` without knowing which checkpoint or local server is currently active.
+The broker is a dependency-free, localhost OpenAI-compatible proxy that exposes **one stable model ID** (`local-auto`) while routing requests to your prioritized local model servers. Use it from Pi CLI, Hermes, CLIProxyAPI, llama.cpp, vLLM, Ollama — anything that speaks OpenAI protocol on the wire.
 
-## Features
+---
 
-- Stable public model ID: `local-auto`
-- Prioritized upstream discovery and automatic return to the preferred server
-- Safe cross-port failover only when both servers advertise the exact same model and sufficient capacity
-- Hot model rediscovery for model-specific 404 responses
-- Live context-window and output-token metadata
-- Request token-limit clamping to the active model's capacity
-- JSON and SSE model-field rewriting without changing generated content
-- Streaming without buffering the full response
-- Downstream cancellation propagated to the upstream request
-- Conservative metadata when an upstream omits nonstandard context fields
-- No Python runtime dependencies outside the standard library
-- Optional Pi provider extension and hardened systemd user-service template
+## What makes this different?
 
-## Requirements
-
-- Python 3.11 or newer
-- OpenAI-compatible local model server on one or both upstream ports
-- Node.js 22 or newer only for Pi extension tests
-- systemd user services only if using the included unit template
-
-Default addresses:
-
-| Role | Address |
+| Problem | Broker fix |
 |---|---|
-| Public broker | `http://127.0.0.1:8879/v1` |
-| Preferred upstream | `http://127.0.0.1:8888/v1` |
-| Fallback upstream | `http://127.0.0.1:8880/v1` |
-| Public model | `local-auto` |
+| You swap a checkpoint and now every config needs updating | **Your clients never know the model changed** — just restart the broker |
+| Your primary model server crashes mid-session | **Automatic failover** to the fallback — but only if it's running the *same* model with *enough* context/output capacity |
+| A vLLM sends `deepseek-ai/DeepSeek-V4-Flash-0731` in the response but your Hermes profile expects `Local` | **Response rewriting** — every top-level `model` field is replaced with `local-auto` without touching generated text |
+| Your client token-limits are fixed at install time | **Live metadata clamping** — the broker reads the active model's context window and output-token limit fresh on every discovery, and clamps your request so it never exceeds what the server can actually handle |
+| You maintain a private fork of a model server with minor changes | **No maintenance** — the broker is <500 lines of stdlib Python, zero pip dependencies |
+| The upstream goes silent for 30 seconds | **Cancellation propagates** — close your client and the upstream connection drops immediately |
+
+---
 
 ## Quick Start
-
-Clone the private repository into the path expected by the included systemd unit:
 
 ```bash
 git clone https://github.com/binhdnguyen/local-model-broker.git \
   ~/.local/share/local-model-broker
 cd ~/.local/share/local-model-broker
-```
 
-Start the broker directly:
-
-```bash
 python3 broker.py \
   --host 127.0.0.1 \
   --port 8879 \
@@ -61,13 +42,7 @@ python3 broker.py \
   --upstream http://127.0.0.1:8880/v1
 ```
 
-Check the catalog:
-
-```bash
-curl -sS http://127.0.0.1:8879/v1/models
-```
-
-Send a completion:
+Verify it works:
 
 ```bash
 curl -sS http://127.0.0.1:8879/v1/chat/completions \
@@ -79,17 +54,58 @@ curl -sS http://127.0.0.1:8879/v1/chat/completions \
   }'
 ```
 
-The response's top-level `model` field remains `local-auto`, regardless of the upstream checkpoint name.
+The response's `model` field says `local-auto` — not whatever unwieldy checkpoint name sits upstream.  
+From now on, `local-auto` is the only model ID your clients ever see.
+
+---
+
+## One alias for every client
+
+| Client | Base URL | Model |
+|---|---|---|
+| Pi (via included extension) | `http://127.0.0.1:8879/v1` | `local-auto` |
+| Hermes custom provider | `http://127.0.0.1:8879/v1` | `local-auto` |
+| CLIProxyAPI | `http://127.0.0.1:8879/v1` | `local-auto` |
+| curl / hurl / httpx | `http://127.0.0.1:8879/v1` | `local-auto` |
+
+Any non-empty API key works — the broker doesn't authenticate by default (binds to `127.0.0.1`).
+
+---
+
+## Features
+
+- **One stable model ID forever** — never touch a client config again
+- **Prioritized upstream discovery** — always prefers `:8888`, returns when it recovers
+- **Safe cross-port failover** — checks model identity + capacity before redirecting; otherwise returns HTTP 409 `local_model_changed`
+- **Hot model rediscovery** — a 404 triggers re-read of the catalog before giving up
+- **Live metadata clamping** — context window and output-token limits fetched fresh from the active model, your request is clamped to match
+- **Response rewriting** — JSON and SSE `model` fields rewritten to `local-auto` without touching generated content
+- **Streaming without buffering** — no full-response buffering means low latency even for long generations
+- **Cancellation propagation** — downstream disconnect kills the upstream request immediately
+- **Zero pip dependencies** — pure Python 3.11+ stdlib, no `requirements.txt` needed
+- **systemd user-service template** included — runs as `--user`, restarts after crash
+- **Pi CLI extension** included — dynamic provider that refreshes metadata before each run
+
+---
+
+## Routing Safety Contracts
+
+The broker doesn't blindly retry. It understands the difference between a transient network blip and a fundamental model change.
+
+| Scenario | Behaviour |
+|---|---|
+| Preferred server down | Fall through to fallback |
+| Both servers running different models | HTTP 409 — no silent model swap |
+| Upstream returns 404 for model ID | Rediscover catalog and retry once |
+| Upstream 404 for unrelated resource | Pass through unchanged |
+| Client drops connection | Cancel upstream immediately (before headers or during SSE silence) |
+| All upstreams fail | Return 502 with error code `no_backend_available` |
+
+Transparent retry is restricted to inference routes (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`). Non-idempotent operations like file or batch creation are never replayed.
+
+---
 
 ## Install as a systemd User Service
-
-The template assumes the repository is located at:
-
-```text
-~/.local/share/local-model-broker
-```
-
-Install and enable it:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -98,112 +114,31 @@ systemctl --user daemon-reload
 systemctl --user enable --now local-model-broker.service
 ```
 
-Inspect the service:
-
-```bash
-systemctl --user status local-model-broker.service --no-pager
-journalctl --user -u local-model-broker.service -n 100 --no-pager
-```
-
 After changing broker code:
 
 ```bash
 systemctl --user restart local-model-broker.service
 ```
 
+---
+
 ## Pi CLI Integration
 
-Install the included dynamic provider extension:
-
 ```bash
-mkdir -p ~/.pi/agent/extensions
 cp extensions/local-auto-provider.ts ~/.pi/agent/extensions/
-```
 
-The extension:
-
-- registers provider and model ID `local-auto`;
-- reads live model metadata from the broker;
-- refreshes metadata before each active `local-auto` run;
-- rebinds the Pi model only when metadata changes;
-- maps DeepSeek and Qwen reasoning formats;
-- uses conservative `16,384` context and `4,096` output-token limits if metadata is unavailable.
-
-Smoke-test Pi:
-
-```bash
 pi --provider local-auto --model local-auto \
   --thinking off --no-tools --no-session \
   -p 'Reply only OK'
 ```
 
-## Other Clients
+The extension: registers the provider, reads live metadata from the broker, refreshes before each run, and rebinds Pi only when metadata changes. It maps DeepSeek and Qwen reasoning formats. Falls back to 16K context / 4K output if metadata is missing.
 
-Any OpenAI-compatible client can use:
-
-```text
-Base URL: http://127.0.0.1:8879/v1
-API key:  any non-empty local value
-Model:    local-auto
-```
-
-For CLIProxyAPI, register `local-auto` as a text-only OpenAI-compatible model whose base URL is the broker endpoint. Hermes custom providers can point directly to the same base URL.
-
-## Routing and Safety Contracts
-
-### Upstream selection
-
-1. Prefer the first healthy upstream in configured order.
-2. Use the fallback when the preferred server is unavailable.
-3. Re-check priority after the discovery TTL and return to the preferred server when it recovers.
-4. Preserve a sticky selection only within the discovery TTL.
-
-### Failover
-
-Transparent retry is restricted to inference routes:
-
-- `/v1/chat/completions`
-- `/v1/completions`
-- `/v1/responses`
-- `/v1/embeddings`
-
-The broker does not replay arbitrary non-idempotent API operations such as file or batch creation after an ambiguous failure.
-
-Cross-port failover is allowed only when the replacement advertises:
-
-- the exact same model ID;
-- at least the original context capacity;
-- at least the original output-token capacity.
-
-Otherwise, the broker returns HTTP `409` with error code `local_model_changed`.
-
-### Model rediscovery
-
-A 404 triggers model rediscovery only when the upstream explicitly reports a missing model. Unrelated resource 404 responses are returned unchanged.
-
-### Response rewriting
-
-The broker rewrites only top-level OpenAI protocol `model` fields. It does not alter:
-
-- generated assistant content;
-- nested application metadata;
-- tool output;
-- arbitrary user-defined JSON.
-
-Body validators such as `Digest`, `Content-MD5`, and `ETag` are removed when the response body is rewritten.
-
-### Cancellation
-
-A downstream EOF or TCP FIN is treated as cancellation. The broker cancels the active upstream task and closes its connection, including:
-
-- before upstream response headers arrive;
-- during a silent SSE interval.
-
-Clients must not half-close their write side while continuing to wait for a response.
+---
 
 ## Configuration
 
-```text
+```
 usage: broker.py [-h] [--host HOST] [--port PORT] [--alias ALIAS]
                  [--upstream UPSTREAM] [--discovery-ttl SECONDS]
                  [--discovery-timeout SECONDS] [--request-timeout SECONDS]
@@ -218,35 +153,24 @@ Environment-variable defaults:
 | `LOCAL_MODEL_BROKER_PORT` | `8879` |
 | `LOCAL_MODEL_BROKER_ALIAS` | `local-auto` |
 
-Pass `--upstream` multiple times to define priority order.
+Pass `--upstream` multiple times for priority order.
+
+---
 
 ## Testing
 
-Run the complete Python unit and integration suite:
-
 ```bash
 python3 -m unittest -v test_broker.py test_integration.py
-```
-
-Run the Pi provider tests:
-
-```bash
 node --experimental-strip-types --test test_local_auto_provider.mjs
 ```
 
-Run syntax and service-template checks:
+Covers real HTTP sockets, SSE streaming, failover, recovery, response framing, and cancellation at various stages.
 
-```bash
-python3 -m py_compile broker.py test_broker.py test_integration.py
-node --experimental-strip-types --check extensions/local-auto-provider.ts
-systemd-analyze --user verify systemd/local-model-broker.service
-```
-
-The integration suite covers real HTTP sockets, SSE streaming, failover, preferred-server recovery, response framing, cancellation before headers, and cancellation during silent SSE periods.
+---
 
 ## Repository Layout
 
-```text
+```
 .
 ├── broker.py                         Broker and asyncio HTTP transport/server
 ├── extensions/
@@ -256,11 +180,18 @@ The integration suite covers real HTTP sockets, SSE streaming, failover, preferr
 ├── test_broker.py                    Routing and protocol unit tests
 ├── test_integration.py               Real-socket integration tests
 ├── test_local_auto_provider.mjs      Pi extension tests
-├── instrutions.md                    Maintainer and local deployment notes
 ├── pyproject.toml                    Python project metadata
 └── uv.lock                           Reproducible empty dependency set
 ```
 
+---
+
 ## Security
 
-The default service binds only to `127.0.0.1`. Keep it local unless you add authentication, TLS, and network-level access controls. Client authorization headers are stripped before forwarding because the default upstreams are local model servers.
+Binds to `127.0.0.1` by default. Keep it there unless you add authentication, TLS, and network-level access controls. Authorization headers are stripped before forwarding to local upstreams.
+
+---
+
+## License
+
+MIT
