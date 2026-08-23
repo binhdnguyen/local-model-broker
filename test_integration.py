@@ -1,15 +1,17 @@
 from __future__ import annotations
-import asyncio
 
+import asyncio
+from collections.abc import Iterator
 import json
+import socket
+import struct
 import threading
 import unittest
 from contextlib import suppress
-import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
-import broker as broker_module
 
+import broker as broker_module
 from broker import Broker, BrokerServer, Upstream, UrlLibTransport
 
 
@@ -59,6 +61,82 @@ class MockModelHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
+
+
+class ControlledSSEHandler(BaseHTTPRequestHandler):
+    model_id = "deepseek-ai/cancel-model"
+
+    def do_GET(self) -> None:
+        if self.path != "/v1/models":
+            self._json(404, {"error": "not found"})
+            return
+        self._json(
+            200,
+            {
+                "object": "list",
+                "data": [
+                    {
+                        "id": self.model_id,
+                        "object": "model",
+                        "max_model_len": 65536,
+                    }
+                ],
+            },
+        )
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("content-length", "0"))
+        self.rfile.read(length)
+        self.server.request_received.set()  # type: ignore[attr-defined]
+        try:
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.wfile.write(
+                b'data: {"model":"deepseek-ai/cancel-model","choices":[{"delta":{"content":"chunk-1"}}]}\n\n'
+            )
+            self.wfile.flush()
+            self.server.first_chunk_sent.set()  # type: ignore[attr-defined]
+
+            if not self.server.allow_terminal.wait(timeout=5):
+                return
+
+            self.wfile.write(
+                b'data: {"model":"deepseek-ai/cancel-model","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                b"data: [DONE]\n\n"
+            )
+            self.wfile.flush()
+            self.server.stream_completed.set()  # type: ignore[attr-defined]
+        except (ConnectionError, OSError):
+            self.server.upstream_broken.set()  # type: ignore[attr-defined]
+        finally:
+            self.server.upstream_closed.set()  # type: ignore[attr-defined]
+
+    def _json(self, status: int, payload: dict[str, object]) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class ControlledSSEServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), ControlledSSEHandler)
+        self.request_received = threading.Event()
+        self.first_chunk_sent = threading.Event()
+        self.allow_terminal = threading.Event()
+        self.stream_completed = threading.Event()
+        self.upstream_broken = threading.Event()
+        self.upstream_closed = threading.Event()
 
 
 class CancellationModelHandler(BaseHTTPRequestHandler):
@@ -222,12 +300,69 @@ class BrokerCancellationIntegrationTests(unittest.TestCase):
         )
         return client
 
+    def test_client_write_half_close_does_not_cancel_sse_response(self) -> None:
+        upstream = ControlledSSEServer()
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        upstream_port = upstream.server_address[1]
+        broker = Broker(
+            upstreams=(
+                Upstream("upstream", f"http://127.0.0.1:{upstream_port}/v1"),
+            ),
+            transport=UrlLibTransport(),
+            alias="local-auto",
+            discovery_ttl=0,
+            request_timeout=30,
+        )
+        broker_server = BrokerServer(("127.0.0.1", 0), broker)
+        threading.Thread(target=broker_server.serve_forever, daemon=True).start()
+        self.broker_server = broker_server
+        self.upstream = upstream
+
+        broker_port = broker_server.server_address[1]
+        client = self._request(broker_port)
+        client.settimeout(5)
+
+        self.assertTrue(upstream.first_chunk_sent.wait(5), "upstream did not send first chunk")
+        received = b""
+        while b"chunk-1" not in received:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            received += chunk
+        self.assertIn(b"chunk-1", received)
+
+        # Client half-closes the write direction
+        client.shutdown(socket.SHUT_WR)
+
+        # Allow upstream to send terminal event
+        upstream.allow_terminal.set()
+
+        while True:
+            try:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                received += chunk
+            except (ConnectionError, OSError):
+                break
+        client.close()
+
+        self.assertTrue(upstream.stream_completed.is_set(), "upstream did not complete stream")
+        self.assertFalse(upstream.upstream_broken.is_set(), "upstream connection was broken prematurely")
+        self.assertIn(b'"finish_reason":"stop"', received)
+        self.assertIn(b"data: [DONE]", received)
+
+    @staticmethod
+    def _reset_close(sock: socket.socket) -> None:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+
     def test_client_disconnect_cancels_upstream_before_headers(self) -> None:
         upstream, broker_port = self._start_servers(send_sse=False)
         client = self._request(broker_port)
         self.assertTrue(upstream.request_received.wait(2), "upstream did not receive request")
 
-        client.close()
+        self._reset_close(client)
 
         self.assertTrue(
             upstream.upstream_closed.wait(2),
@@ -243,7 +378,7 @@ class BrokerCancellationIntegrationTests(unittest.TestCase):
             received += client.recv(4096)
         self.assertTrue(upstream.request_received.is_set())
 
-        client.close()
+        self._reset_close(client)
 
         self.assertTrue(
             upstream.upstream_closed.wait(2),
@@ -285,6 +420,85 @@ class BodylessResponseIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(head.startswith(b"HTTP/1.1 204"))
         self.assertNotIn(b"content-length:", head.lower())
         self.assertEqual(body, b"")
+
+class ResponseWriteFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_response_write_failure_closes_upstream_body(self) -> None:
+        class ClosableAsyncBody:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def __aiter__(self) -> ClosableAsyncBody:
+                return self
+
+            async def __anext__(self) -> bytes:
+                return b"data: test\r\n\r\n"
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        class FailingWriter:
+            def write(self, _data: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                raise BrokenPipeError("client write failed")
+
+        body = ClosableAsyncBody()
+
+        class StubBroker:
+            async def handle_async(
+                self, *_args: object
+            ) -> tuple[int, dict[str, str], ClosableAsyncBody]:
+                return 200, {"content-type": "text/event-stream"}, body
+
+        await broker_module._serve_response(
+            StubBroker(),  # type: ignore[arg-type]
+            "POST",
+            "/v1/chat/completions",
+            {},
+            None,
+            FailingWriter(),  # type: ignore[arg-type]
+        )
+
+        self.assertTrue(body.closed, "upstream async body was not closed on write failure")
+
+    async def test_response_write_failure_closes_sync_upstream_body(self) -> None:
+        class ClosableSyncBody:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def __iter__(self) -> Iterator[bytes]:
+                yield b"data: test\r\n\r\n"
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FailingWriter:
+            def write(self, _data: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                raise ConnectionResetError("connection reset by peer")
+
+        body = ClosableSyncBody()
+
+        class StubBroker:
+            async def handle_async(
+                self, *_args: object
+            ) -> tuple[int, dict[str, str], ClosableSyncBody]:
+                return 200, {"content-type": "text/event-stream"}, body
+
+        await broker_module._serve_response(
+            StubBroker(),  # type: ignore[arg-type]
+            "POST",
+            "/v1/chat/completions",
+            {},
+            None,
+            FailingWriter(),  # type: ignore[arg-type]
+        )
+
+        self.assertTrue(body.closed, "upstream sync body was not closed on write failure")
+
 
 if __name__ == "__main__":
     unittest.main()

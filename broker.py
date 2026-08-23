@@ -13,6 +13,7 @@ import time
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import Enum
 from http import HTTPStatus
 from typing import Any, Protocol, TypeVar
 from urllib.error import HTTPError, URLError
@@ -903,12 +904,18 @@ async def _read_client_request(
     return method, path, headers, body
 
 
-async def _watch_downstream(reader: asyncio.StreamReader) -> None:
+class DownstreamReadState(Enum):
+    CLEAN_EOF = "clean_eof"
+    ERROR = "error"
+
+
+async def _watch_downstream(reader: asyncio.StreamReader) -> DownstreamReadState:
     try:
         while await reader.read(1):
             pass
-    except (ConnectionError, asyncio.IncompleteReadError):
-        return
+    except (ConnectionError, asyncio.IncompleteReadError, OSError):
+        return DownstreamReadState.ERROR
+    return DownstreamReadState.CLEAN_EOF
 
 
 async def _serve_response(
@@ -962,7 +969,7 @@ async def _handle_connection(
     writer: asyncio.StreamWriter,
 ) -> None:
     serve_task: asyncio.Task[None] | None = None
-    watch_task: asyncio.Task[None] | None = None
+    watch_task: asyncio.Task[DownstreamReadState] | None = None
     try:
         method, path, headers, body = await _read_client_request(reader)
         serve_task = asyncio.create_task(
@@ -974,7 +981,12 @@ async def _handle_connection(
             return_when=asyncio.FIRST_COMPLETED,
         )
         if watch_task in done and not serve_task.done():
-            serve_task.cancel()
+            try:
+                watch_state = watch_task.result()
+            except Exception:
+                watch_state = DownstreamReadState.ERROR
+            if watch_state == DownstreamReadState.ERROR:
+                serve_task.cancel()
         await asyncio.gather(serve_task, return_exceptions=True)
     except EOFError:
         pass
