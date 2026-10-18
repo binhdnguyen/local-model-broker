@@ -1,0 +1,8 @@
+{
+  "http://192.168.1.12:8888/v1": {
+    "Qwen3.8-Flash-Next": {
+      "max_model_len": 1048576,
+      "max_output_tokens": 32768
+    }
+  }
+}

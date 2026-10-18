@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+from pathlib import Path
 import socket
 import ssl
 import threading
@@ -162,6 +163,42 @@ class UrlLibTransport:
             raise ValueError(f"{upstream.name} returned no model list")
         return [model for model in data if isinstance(model, dict) and model.get("id")]
 
+    async def fetch_context_length(self, upstream: Upstream, timeout: float) -> int | None:
+        """Read TensorFold's prompt window from the origin /health endpoint.
+
+        The OpenAI model list from that server has no context field. /health
+        is on the host root, not under the upstream's /v1 prefix.
+        """
+        parsed = urlsplit(upstream.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+        origin = Upstream(upstream.name, f"{parsed.scheme}://{parsed.netloc}")
+        try:
+            response = await self.request(
+                origin,
+                "GET",
+                "/health",
+                {"accept": "application/json"},
+                None,
+                timeout,
+            )
+        except (OSError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
+            return None
+        payload: Any = None
+        try:
+            if 200 <= response.status < 300:
+                payload = json.loads(await _body_bytes(response.body))
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            payload = None
+        finally:
+            await _close_response(response)
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("context_length")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return None
+
     async def request(
         self,
         upstream: Upstream,
@@ -240,6 +277,7 @@ class Broker:
         discovery_ttl: float = 2.0,
         discovery_timeout: float = 1.5,
         request_timeout: float = 3600.0,
+        limits_file: Path | None = None,
     ) -> None:
         if not upstreams:
             raise ValueError("at least one upstream is required")
@@ -249,6 +287,7 @@ class Broker:
         self._discovery_ttl = discovery_ttl
         self._discovery_timeout = discovery_timeout
         self._request_timeout = request_timeout
+        self._limits_file = limits_file
         self._selection: Selection | None = None
         self._lock = threading.Lock()
 
@@ -477,7 +516,27 @@ class Broker:
             if not models:
                 errors.append(f"{upstream.name}: empty model catalog")
                 continue
-            selection = Selection(upstream=upstream, model=models[0], selected_at=now)
+            model = dict(models[0])
+            if _context_capacity(model) is None:
+                context = await self._context_from_health(upstream)
+                if context is not None:
+                    model["context_length"] = context
+            try:
+                limits = self._configured_limits(upstream, str(model["id"]))
+            except (OSError, ValueError, TypeError) as error:
+                errors.append(f"{upstream.name}: invalid limits configuration: {error}")
+                continue
+            if _context_capacity(model) is None and "max_model_len" in limits:
+                model["max_model_len"] = limits["max_model_len"]
+            if not any(isinstance(model.get(key), int) and not isinstance(model.get(key), bool)
+                       and model[key] > 0 for key in ("max_output_tokens", "max_tokens")):
+                if "max_output_tokens" in limits:
+                    model["max_output_tokens"] = limits["max_output_tokens"]
+            if _context_capacity(model) is None:
+                errors.append(f"{upstream.name}: context limit missing for {model['id']}; "
+                              "publish server metadata or configure limits.json for this endpoint/model")
+                continue
+            selection = Selection(upstream=upstream, model=model, selected_at=now)
             with self._lock:
                 previous = self._selection
                 if previous is None or (
@@ -496,6 +555,37 @@ class Broker:
             if self._selection is current:
                 self._selection = None
         raise LocalModelUnavailable("; ".join(errors) or "No local model endpoint is ready")
+
+    def _configured_limits(self, upstream: Upstream, model_id: str) -> dict[str, int]:
+        if self._limits_file is None or not self._limits_file.exists():
+            return {}
+        # Reload on discovery; never apply a previous model's limits after a swap.
+        config = json.loads(self._limits_file.read_text())
+        if not isinstance(config, dict):
+            raise ValueError("limits.json must be an endpoint/model mapping")
+        models = config.get(upstream.base_url, {})
+        if not isinstance(models, dict):
+            raise ValueError("endpoint limits must be a model mapping")
+        limits = models.get(model_id, {})
+        if not isinstance(limits, dict):
+            raise ValueError("model limits must be an object")
+        for key, value in limits.items():
+            if key not in {"max_model_len", "max_output_tokens"} or isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"invalid model limit: {key}")
+        return limits
+
+    async def _context_from_health(self, upstream: Upstream) -> int | None:
+        fetch_context = getattr(self._transport, "fetch_context_length", None)
+        if fetch_context is None:
+            return None
+        try:
+            context = await _resolve(fetch_context(upstream, self._discovery_timeout))
+        except (OSError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as error:
+            LOGGER.debug("context lookup failed for %s: %s", upstream.base_url, error)
+            return None
+        if isinstance(context, int) and not isinstance(context, bool) and context > 0:
+            return context
+        return None
 
     def _invalidate(self, selection: Selection) -> None:
         with self._lock:
@@ -565,6 +655,12 @@ def _context_capacity(model: dict[str, Any]) -> int | None:
         "max_context_length",
     ):
         value = model.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    # llama.cpp reports the context inside meta.n_ctx instead of a top-level key
+    meta = model.get("meta")
+    if isinstance(meta, dict):
+        value = meta.get("n_ctx")
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
     return None
@@ -1090,6 +1186,8 @@ def main() -> None:
         dest="upstreams",
         help="OpenAI-compatible base URL in priority order; repeatable",
     )
+    parser.add_argument("--limits-file", type=Path, default=Path(__file__).with_name("limits.json"),
+                        help="Endpoint/model-scoped fallback limits for servers missing metadata")
     parser.add_argument("--discovery-ttl", type=float, default=2.0)
     parser.add_argument("--discovery-timeout", type=float, default=1.5)
     parser.add_argument("--request-timeout", type=float, default=3600.0)
@@ -1111,6 +1209,7 @@ def main() -> None:
         discovery_ttl=args.discovery_ttl,
         discovery_timeout=args.discovery_timeout,
         request_timeout=args.request_timeout,
+        limits_file=args.limits_file,
     )
     server = BrokerServer((args.host, args.port), broker)
     LOGGER.info(
