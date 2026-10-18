@@ -204,3 +204,46 @@ Binds to `127.0.0.1` by default. Keep it there unless you add authentication, TL
 ## License
 
 MIT
+
+## Missing server capacity metadata (2026-10-18)
+
+Context is discovered from `/v1/models` (including llama.cpp `meta.n_ctx`),
+then origin `/health` `context_length`. The broker no longer fabricates a 16K
+context when both are missing: discovery fails with HTTP 503 and an explanation.
+This prevents Pi from clamping generation to one token under its safety reserve.
+
+For servers that omit capacity, `--limits-file` defaults to `limits.json` beside
+`broker.py`. It is re-read each discovery and scoped to exact upstream base URL
+and exact server model ID, never the public alias. For example:
+
+```json
+{
+  "http://192.168.1.12:8888/v1": {
+    "Qwen3.8-Flash-Next": {
+      "max_model_len": 1048576,
+      "max_output_tokens": 32768
+    }
+  }
+}
+```
+
+These values match the running TensorFold process flags. The 1,048,576-token
+window was checked at its admission boundary and with a successful 999,581-input-
+token retrieval request; the server uses YaRN factor 4 and one concurrent request.
+Live catalog/health context and live catalog output limits take precedence.
+On any model swap or launch-limit change, publish accurate server metadata or
+update that exact entry to the actual runtime limits; do not use checkpoint
+architectural maxima. Unknown models without metadata fail closed rather than
+inheriting the previous model's limits. When output metadata alone is missing,
+the existing conservative context/4 derivation (capped at 65536) is unchanged.
+Pi's installed extension refreshes and rebinds metadata before local-auto runs;
+select local-auto in `/model` to use the corrected catalog. No Pi core patch or
+model restart is required. Backups: `backups/truncation-20261018/`.
+
+Verification: 33 Python unit/integration tests and 6 provider tests passed; Python
+compile passed. LaunchDaemon respawned broker on loopback 8879 after idle restart.
+Real Pi high-thinking ping and ~25k-token input ping ended normally. An approximate
+300-word Vietnamese story completed (502 output tokens). Two exact-count story
+checks hit 90/120-second test deadlines while still reasoning/counting words;
+`--thinking off` did not suppress server reasoning in that check. Those latency/
+thinking-control issues are separate and not fixed here. Model runtime unchanged.

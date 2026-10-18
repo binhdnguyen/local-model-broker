@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import unittest
+import tempfile
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -32,6 +34,7 @@ class FakeResponse:
 class FakeTransport:
     def __init__(self) -> None:
         self.catalogs: dict[str, list[dict[str, Any]] | Exception] = {}
+        self.context_lengths: dict[str, int | None | Exception] = {}
         self.responses: dict[tuple[str, str], list[FakeResponse | HTTPError | URLError]] = {}
         self.requests: list[tuple[str, str, dict[str, str], bytes | None]] = []
 
@@ -48,6 +51,12 @@ class FakeTransport:
 
     def fetch_catalog(self, upstream: Upstream, _timeout: float) -> list[dict[str, Any]]:
         result = self.catalogs.get(upstream.base_url, URLError("down"))
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def fetch_context_length(self, upstream: Upstream, _timeout: float) -> int | None:
+        result = self.context_lengths.get(upstream.base_url)
         if isinstance(result, Exception):
             raise result
         return result
@@ -407,18 +416,63 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"][0]["max_output_tokens"], 16384)
 
-    def test_catalog_uses_conservative_limits_without_context_metadata(self) -> None:
+    def test_catalog_rejects_unknown_context_instead_of_inventing_16k(self) -> None:
+        self.transport.set_catalog("http://127.0.0.1:8888/v1", [{"id": "unknown"}])
+        status, _, body = self.broker.handle("GET", "/v1/models", {}, None)
+        self.assertEqual(status, 503)
+        self.assertIn("context", json.loads(body)["error"]["message"])
+
+    def test_limits_are_live_and_scoped_to_endpoint_and_model(self) -> None:
+        primary = "http://127.0.0.1:8888/v1"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "limits.json"
+            self.broker._limits_file = path
+            path.write_text(json.dumps({primary: {"model-a": {
+                "max_model_len": 262144, "max_output_tokens": 32768}}}))
+            self.transport.set_catalog(primary, [{"id": "model-a"}])
+            status, _, body = self.broker.handle("GET", "/v1/models", {}, None)
+            self.assertEqual(status, 200)
+            model = json.loads(body)["data"][0]
+            self.assertEqual(model["max_model_len"], 262144)
+            self.assertEqual(model["max_output_tokens"], 32768)
+            # Actual upstream metadata wins over the operator fallback.
+            self.transport.set_catalog(primary, [{"id": "model-a", "max_model_len": 65536,
+                                                    "max_output_tokens": 8192}])
+            status, _, body = self.broker.handle("GET", "/v1/models", {}, None)
+            self.assertEqual(json.loads(body)["data"][0]["max_model_len"], 65536)
+            self.assertEqual(json.loads(body)["data"][0]["max_output_tokens"], 8192)
+            self.transport.set_catalog(primary, [{"id": "model-b"}])
+            self.assertEqual(self.broker.handle("GET", "/v1/models", {}, None)[0], 503)
+            path.write_text(json.dumps({primary: {"model-b": {"max_model_len": 131072}}}))
+            status, _, body = self.broker.handle("GET", "/v1/models", {}, None)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["data"][0]["max_model_len"], 131072)
+            self.transport.set_catalog(primary, URLError("down"))
+            self.transport.set_catalog("http://127.0.0.1:8880/v1", [{"id": "model-b"}])
+            self.assertEqual(self.broker.handle("GET", "/v1/models", {}, None)[0], 503)
+
+    def test_invalid_limit_configuration_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "limits.json"
+            self.broker._limits_file = path
+            self.transport.set_catalog("http://127.0.0.1:8888/v1", [{"id": "unknown"}])
+            for value in ["{", "[]", '{"http://127.0.0.1:8888/v1":{"unknown":{"max_model_len":true}}}']:
+                path.write_text(value)
+                self.assertEqual(self.broker.handle("GET", "/v1/models", {}, None)[0], 503)
+
+    def test_catalog_uses_health_context_length_when_model_list_omits_it(self) -> None:
         self.transport.set_catalog(
             "http://127.0.0.1:8888/v1",
-            [{"id": "vendor/minimal-model", "object": "model"}],
+            [{"id": "GLM-5.3-Flash-EXL3", "object": "model"}],
         )
+        self.transport.context_lengths["http://127.0.0.1:8888/v1"] = 1_048_576
 
         status, _, body = self.broker.handle("GET", "/v1/models", {}, None)
 
         model = json.loads(body)["data"][0]
         self.assertEqual(status, 200)
-        self.assertEqual(model["max_model_len"], 16384)
-        self.assertEqual(model["max_output_tokens"], 4096)
+        self.assertEqual(model["max_model_len"], 1_048_576)
+        self.assertEqual(model["max_output_tokens"], 65_536)
 
     def test_404_invalidates_catalog_and_retries_once(self) -> None:
         primary = "http://127.0.0.1:8888/v1"
