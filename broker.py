@@ -164,39 +164,49 @@ class UrlLibTransport:
         return [model for model in data if isinstance(model, dict) and model.get("id")]
 
     async def fetch_context_length(self, upstream: Upstream, timeout: float) -> int | None:
-        """Read TensorFold's prompt window from the origin /health endpoint.
+        """Read the prompt window of a server whose model list has no context field.
 
-        The OpenAI model list from that server has no context field. /health
-        is on the host root, not under the upstream's /v1 prefix.
+        TensorFold's Python engine reports it as /health context_length. Its Zig
+        engine (and vLLM) report it only as max_model_len in a /tokenize reply,
+        so a one-token tokenize is the fallback. Both paths are on the host root,
+        not under the upstream's /v1 prefix.
         """
         parsed = urlsplit(upstream.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return None
         origin = Upstream(upstream.name, f"{parsed.scheme}://{parsed.netloc}")
+        for method, path, body, key in (
+            ("GET", "/health", None, "context_length"),
+            ("POST", "/tokenize", b'{"prompt":"x"}', "max_model_len"),
+        ):
+            payload = await self._origin_json(origin, method, path, body, timeout)
+            value = payload.get(key) if isinstance(payload, dict) else None
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return None
+
+    async def _origin_json(
+        self,
+        origin: Upstream,
+        method: str,
+        path: str,
+        body: bytes | None,
+        timeout: float,
+    ) -> Any:
+        headers = {"accept": "application/json"}
+        if body is not None:
+            headers["content-type"] = "application/json"
         try:
-            response = await self.request(
-                origin,
-                "GET",
-                "/health",
-                {"accept": "application/json"},
-                None,
-                timeout,
-            )
+            response = await self.request(origin, method, path, headers, body, timeout)
         except (OSError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
             return None
-        payload: Any = None
         try:
             if 200 <= response.status < 300:
-                payload = json.loads(await _body_bytes(response.body))
+                return json.loads(await _body_bytes(response.body))
         except (OSError, TimeoutError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
-            payload = None
+            return None
         finally:
             await _close_response(response)
-        if not isinstance(payload, dict):
-            return None
-        value = payload.get("context_length")
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
         return None
 
     async def request(

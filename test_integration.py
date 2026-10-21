@@ -63,6 +63,40 @@ class MockModelHandler(BaseHTTPRequestHandler):
         return
 
 
+class ZigTensorFoldHandler(BaseHTTPRequestHandler):
+    """TensorFold's Zig server: no context in /v1/models or /health, only in /tokenize."""
+
+    model_id = "DeepSeek-V4.1-Flash-1017"
+    context_window = 1048576
+
+    def do_GET(self) -> None:
+        if self.path == "/v1/models":
+            self._json(200, {"object": "list", "data": [{"id": self.model_id, "object": "model"}]})
+        elif self.path == "/health":
+            self._json(200, {"status": "ok", "model": self.model_id, "max_batch_size": 4})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("content-length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        if self.path == "/tokenize" and isinstance(payload.get("prompt"), str):
+            self._json(200, {"count": 1, "max_model_len": self.context_window, "tokens": [90]})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def _json(self, status: int, payload: dict[str, object]) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
 class ControlledSSEHandler(BaseHTTPRequestHandler):
     model_id = "deepseek-ai/cancel-model"
 
@@ -246,6 +280,29 @@ class BrokerIntegrationTests(unittest.TestCase):
             self.assertEqual(catalog["data"][0]["max_model_len"], 196608)
             self.assertEqual(completion["model"], "local-auto")
             self.assertEqual(completion["choices"][0]["message"]["content"], "OK")
+        finally:
+            broker_server.shutdown()
+            broker_server.server_close()
+            upstream_server.shutdown()
+            upstream_server.server_close()
+
+    def test_http_broker_reads_zig_tensorfold_window_from_tokenize(self) -> None:
+        upstream_server = ThreadingHTTPServer(("127.0.0.1", 0), ZigTensorFoldHandler)
+        threading.Thread(target=upstream_server.serve_forever, daemon=True).start()
+        port = upstream_server.server_address[1]
+        broker = Broker(
+            upstreams=(Upstream("zig", f"http://127.0.0.1:{port}/v1"),),
+            transport=UrlLibTransport(),
+            alias="local-auto",
+            discovery_ttl=0,
+        )
+        broker_server = BrokerServer(("127.0.0.1", 0), broker)
+        threading.Thread(target=broker_server.serve_forever, daemon=True).start()
+        try:
+            with urlopen(f"http://127.0.0.1:{broker_server.server_address[1]}/v1/models", timeout=5) as response:
+                catalog = json.loads(response.read())
+            self.assertEqual(catalog["data"][0]["root"], "DeepSeek-V4.1-Flash-1017")
+            self.assertEqual(catalog["data"][0]["max_model_len"], 1048576)
         finally:
             broker_server.shutdown()
             broker_server.server_close()
