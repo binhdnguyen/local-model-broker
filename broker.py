@@ -754,6 +754,21 @@ def _rewrite_request_model(
             value = payload.get(key)
             if isinstance(value, int) and not isinstance(value, bool) and value > max_output_tokens:
                 payload[key] = max_output_tokens
+        effort = payload.get("reasoning_effort")
+        if isinstance(effort, str):
+            effort_norm = effort.strip().lower()
+            if effort_norm in ("high", "max", "ultra"):
+                payload["reasoning_effort"] = "xhigh"
+            elif effort_norm == "minimal":
+                payload["reasoning_effort"] = "low"
+        if isinstance(payload.get("chat_template_kwargs"), dict):
+            ct_effort = payload["chat_template_kwargs"].get("reasoning_effort")
+            if isinstance(ct_effort, str):
+                ct_norm = ct_effort.strip().lower()
+                if ct_norm in ("high", "max", "ultra"):
+                    payload["chat_template_kwargs"]["reasoning_effort"] = "xhigh"
+                elif ct_norm == "minimal":
+                    payload["chat_template_kwargs"]["reasoning_effort"] = "low"
         return json.dumps(payload, separators=(",", ":")).encode()
     return body
 
